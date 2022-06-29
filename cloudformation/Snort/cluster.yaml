@@ -1,0 +1,678 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  VpcId:
+    Description: The VPC id
+    Type: String
+  VpcCidr:
+    Description: The VPC CIDR block
+    Type: String
+  PrivateSubnet1:
+    Description: The Private Subnet 1 id
+    Type: String
+  PrivateSubnet2:
+    Description: The Private Subnet 2 id
+    Type: String
+  PrivateSubnet3:
+    Description: The Private Subnet 3 id
+    Type: String
+  Ami:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: "/aws/service/ecs/optimized-ami/amazon-linux-2/recommended/image_id"
+
+  PcapLogRententionS3:
+    Description: "How many days Pcap log should be saved in S3"
+    Default: 30
+    Type: Number
+
+  DefaultLogRententionCloudWatch:
+    Description: "How many days snort3 logs should be saved in Cloudwatch"
+    Default: 3
+    Type: Number
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  SnortImage:
+    Description: Container image
+    Type: String
+    Default: ""
+
+  SnortInstanceType:
+    Type: String
+    Default: t3.large
+
+  SnortClusterMinSize:
+    Description: The base number of Snort containers in the cluster. Each container will have it's own EC2 instance.
+    Type: String
+    Default: 2
+
+  SnortClusterMaxSize:
+    Description: The maximum number of Snort containers in the cluster. Each container will have it's own EC2 instance.
+    Type: String
+    Default: 10
+
+  SnortCpuScalingPercentage:
+    Description: ECS will scale up a new Snort container when the service reaches this average CPU utilization.
+    Type: String
+    Default: 80.0
+
+Resources:
+  SnortFileLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /${AWS::StackName}/Snort/FileLogs
+      RetentionInDays: !Ref DefaultLogRententionCloudWatch
+  SnortDataLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /${AWS::StackName}/Snort/Data_log
+      RetentionInDays: !Ref DefaultLogRententionCloudWatch
+  SnortAppIDLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /${AWS::StackName}/Snort/appid
+      RetentionInDays: !Ref DefaultLogRententionCloudWatch
+  SnortAlertCSVLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: !Sub /${AWS::StackName}/Snort/alert_csv
+      RetentionInDays: !Ref DefaultLogRententionCloudWatch
+          
+  SnortPcapBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    Properties:
+      BucketName: !Sub 
+        - snort-pcapfiles-${AWS::Region}-${AWS::AccountId}-${RandomizedValue}
+        - RandomizedValue:
+            Fn::Select: [0, Fn::Split: [-, Fn::Select: [2, Fn::Split: [/, !Ref AWS::StackId ]]]] # Takes the first part of the random GUID in the cloudformation stacks arn.
+      LifecycleConfiguration:
+        Rules:
+          - Status: Enabled
+            ExpirationInDays: !Ref PcapLogRententionS3
+      BucketEncryption: 
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      
+  SnortLogsEfs:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: True
+    
+  SnortLogsEfsMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref SnortLogsEfs
+      SecurityGroups: 
+        - !Ref SnortLogsEfsSecurityGroup
+      SubnetId: !Ref PrivateSubnet1
+
+  SnortLogsEfsMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref SnortLogsEfs
+      SecurityGroups: 
+        - !Ref SnortLogsEfsSecurityGroup
+      SubnetId: !Ref PrivateSubnet2
+
+  SnortLogsEfsMountTarget3:
+    Type: AWS::EFS::MountTarget
+    Properties: 
+      FileSystemId: !Ref SnortLogsEfs
+      SecurityGroups: 
+        - !Ref SnortLogsEfsSecurityGroup
+      SubnetId: !Ref PrivateSubnet3
+
+  SnortLogsEfsSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: >-
+        Snort Security group
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref SnortSecurityGroup
+          IpProtocol: "TCP"
+          FromPort: 2049
+          ToPort: 2049 
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+      Tags:
+        - Key: Name
+          Value: "EFS SG"
+##
+## ECS
+##
+  SnortEcsCluster:
+    Type: AWS::ECS::Cluster
+
+  SnortService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - "SnortAutoScalingGroup"
+      - "SnortCapacityProviderAssociation" 
+    Properties: 
+      Cluster: !Ref SnortEcsCluster
+      DeploymentConfiguration: 
+        MaximumPercent: 100
+        MinimumHealthyPercent: 50
+      DeploymentController: 
+        Type: ECS
+      DesiredCount: !Ref SnortClusterMinSize
+      EnableECSManagedTags: true
+      PlacementConstraints: 
+        - Type: distinctInstance 
+      SchedulingStrategy: REPLICA
+      ServiceName: Snort
+      TaskDefinition: !Ref SnortTaskDefinition
+
+  SnortCapacityProvider:
+    Type: AWS::ECS::CapacityProvider
+    Properties:
+      AutoScalingGroupProvider: 
+        AutoScalingGroupArn: !Ref SnortAutoScalingGroup
+        ManagedScaling: 
+          TargetCapacity: 100
+          Status: ENABLED
+        ManagedTerminationProtection: DISABLED
+
+  SnortCapacityProviderAssociation: 
+    Type: AWS::ECS::ClusterCapacityProviderAssociations
+    Properties: 
+      CapacityProviders: 
+        - !Ref SnortCapacityProvider
+      Cluster: !Ref SnortEcsCluster 
+      DefaultCapacityProviderStrategy: 
+        - Base: !Ref SnortClusterMinSize
+          Weight: 1
+          CapacityProvider: !Ref SnortCapacityProvider
+
+  SnortTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties: 
+        Family: !Sub ${AWS::StackName}-SnortTaskDefinition
+        NetworkMode: host
+        Volumes:
+        - Host: 
+            SourcePath: /var/log/snort/
+          Name: SnortLogs
+        RequiresCompatibilities:
+          - "EC2"
+        ContainerDefinitions: 
+          - Name: "Snort"
+            Image: !Ref SnortImage
+            MountPoints: 
+              - SourceVolume: "SnortLogs"
+                ContainerPath: "/var/log/snort"
+            MemoryReservation: 2048
+            Essential: true
+            LogConfiguration:
+              LogDriver: awslogs
+              Options:
+                awslogs-group: !Sub "/${AWS::StackName}/container/snort/stdout"
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: "stdout"
+                awslogs-create-group: "true"
+            LinuxParameters:
+              Capabilities:
+                Add:
+                - NET_ADMIN
+                - SYS_NICE
+              
+  SnortScalableTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      RoleARN: !GetAtt SnortEcsAutoScalingRole.Arn
+      ResourceId: !Sub  service/${SnortEcsCluster}/${SnortService.Name}
+      ServiceNamespace: ecs
+      ScalableDimension: ecs:service:DesiredCount
+      MinCapacity: !Ref SnortClusterMinSize
+      MaxCapacity: !Ref SnortClusterMaxSize
+
+  AvgCpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: cpu-Snort-tracking-scaling-policy
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref SnortScalableTarget
+      TargetTrackingScalingPolicyConfiguration:
+        DisableScaleIn: false
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 300
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        TargetValue: !Ref SnortCpuScalingPercentage
+
+  SnortEcsAutoScalingRole:
+      Type: AWS::IAM::Role
+      Properties:
+        AssumeRolePolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: [application-autoscaling.amazonaws.com]
+              Action: ["sts:AssumeRole"]
+        Policies:
+          - PolicyName: SnortEcsAutoScalingPolicy
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - ecs:DescribeServices
+                    - ecs:UpdateService
+                    - cloudwatch:PutMetricAlarm
+                    - cloudwatch:DescribeAlarms
+                    - cloudwatch:DeleteAlarms
+                  Resource:
+                    - "*"
+
+##
+## Compute
+##
+  SnortSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref VpcId
+      GroupDescription: >-
+        Snort Security group
+      SecurityGroupIngress:
+        - CidrIp: !Ref VpcCidr
+          IpProtocol: udp
+          FromPort: 6081
+          ToPort: 6081
+          Description: Ingress rule for Geneve protocol
+        - CidrIp: !Ref VpcCidr
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          Description: Ingress rule for HTTP Healthcheck
+      SecurityGroupEgress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: "-1"
+          FromPort: -1
+          ToPort: -1
+      Tags:
+        - Key: Name
+          Value: "Snort SG"
+
+  Gwlb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: gateway
+      LoadBalancerAttributes:
+        - Key: load_balancing.cross_zone.enabled
+          Value: True
+      Subnets:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+        - !Ref PrivateSubnet3
+      Tags:
+      - Key: Name
+        Value: "Snort GWLB"
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 6081
+      Protocol: GENEVE
+      TargetGroupAttributes:
+      - Key: deregistration_delay.timeout_seconds
+        Value: "20"
+      VpcId: !Ref VpcId
+      HealthCheckPort: "80"
+      HealthCheckProtocol: HTTP
+      TargetType: instance
+      Tags:
+      - Key: Name
+        Value: "Snort Target Group"
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn: !Ref TargetGroup
+      LoadBalancerArn: !Ref Gwlb
+
+  SnortEcsInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+        - "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+        - "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+      Policies:
+        - PolicyDocument:
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeNetworkInterfaces
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                Resource: !Sub ${SnortPcapBucket.Arn}/*
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameters
+                  - ssm:GetParameter
+                  - ssm:GetParametersByPath
+                  - ssm:PutParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${AWS::StackName}/Snort/*
+          PolicyName: SnortEc2Policy
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /
+
+  SnortEcsInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles:
+        - !Ref SnortEcsInstanceRole
+  
+  SnortLaunchConfiguration:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      IamInstanceProfile: !Ref SnortEcsInstanceProfile
+      InstanceType: !Ref SnortInstanceType
+      ImageId: !Ref Ami
+      SecurityGroups:
+      - !Ref SnortSecurityGroup
+      UserData:
+        Fn::Base64:
+          !Sub |
+          #!/bin/bash -x
+          
+          ################
+          # Preperations #
+          ################
+          
+          # Install packages
+          yum update -y
+          yum install -y amazon-cloudwatch-agent
+          yum install -y ethtool awscli iptables-services
+          
+          set -e
+          
+          # Define variables
+          curl --silent http://169.254.169.254/latest/dynamic/instance-identity/document > /home/ec2-user/iid
+          instance_ip=$(cat /home/ec2-user/iid | awk -F '"' '/privateIp/ {print $4}')
+          instance_id=$(cat /home/ec2-user/iid | awk -F '"' '/instanceId/ {print $4}')
+          
+          # Enable IP Forwarding:
+          sysctl -w net.ipv4.ip_forward=1
+
+          ##########################
+          # IPTABLES CONFIGURATION #
+          ##########################
+
+          # Start and configure iptables:
+          systemctl enable iptables
+          systemctl start iptables
+          
+          # Flush the nat and mangle tables, flush all chains (-F), and delete all non-default chains (-X):
+          iptables -t nat -F
+          iptables -t mangle -F
+          iptables -F
+          iptables -X
+
+          # Set the default policies for each of the built-in chains to ACCEPT:
+          iptables -P INPUT ACCEPT
+          iptables -P FORWARD ACCEPT
+          iptables -P OUTPUT ACCEPT
+
+          # Set a punt to Snort via NFQUEUE
+          iptables -I FORWARD -j NFQUEUE
+
+          # Configure nat table to hairpin traffic back to GWLB. Supports cross zone LB.
+          for i in $(aws --region ${AWS::Region} ec2 describe-network-interfaces --filters Name=vpc-id,Values=${VpcId} --query 'NetworkInterfaces[?InterfaceType==`gateway_load_balancer`].PrivateIpAddress' --output text); do 
+            iptables -t nat -A PREROUTING -p udp -s $i -d $instance_ip -i eth0 -j DNAT --to-destination $i:6081
+            iptables -t nat -A POSTROUTING -p udp --dport 6081 -s $i -d $i -o eth0 -j MASQUERADE
+          done
+
+          # Save iptables:
+          service iptables save
+          
+          #####################
+          # EFS CONFIGURATION #
+          #####################
+          mkdir -p /mnt/efs/
+          mount -t efs -o tls ${SnortLogsEfs}:/ /mnt/efs/
+          mkdir -p /mnt/efs/$instance_id/snort
+
+          ln -s /mnt/efs/$instance_id/snort /var/log/
+          chown 1001 /var/log/snort/ #Make the Snort user the owner of the log folder.
+
+          ###########################
+          # LOGROTATE CONFIGURATION #
+          ###########################
+          cat > /etc/logrotate.d/snort << 'EOF'
+          /var/log/snort/*.log /var/log/snort/*.txt /var/log/snort/data_log* {
+          rotate 2
+          daily
+          size 200M
+          copytruncate
+          missingok
+          nocompress
+          createolddir
+          olddir /var/log/snort/rotated/logs
+          }
+          EOF
+          
+          cat > /opt/logrotate.sh << 'EOF'
+          /usr/sbin/logrotate -s /var/lib/logrotate/logrotate.status /etc/logrotate.d/Snort
+          for I in $(ls -t /var/log/snort/log.pcap.* | tail -n +2); do /usr/bin/aws s3 mv $I s3://${SnortPcapBucket}/$(date -d @${!I##*.} +'%Y/%m/%d/%H:%M:%S'.pcap)  --content-type "application/vnd.tcpdump.pcap" --metadata InstanceId=$instance_id; done
+          EOF
+
+          chmod +x /opt/logrotate.sh
+          echo "* * * * * /opt/logrotate.sh > /dev/null 2>&1" | crontab -
+
+          ####################
+          # CLOUDWATCH AGENT #
+          ####################
+          cat > /opt/aws/amazon-cloudwatch-agent/bin/config.json << 'EOF'
+          {
+            "agent": {
+              "metrics_collection_interval": 60,
+              "run_as_user": "ssm-user"
+            },
+            "logs": {
+              "logs_collected": {
+                "files": {
+                  "collect_list": [
+                    {"file_path": "/var/log/snort/file.log", "log_group_name": "/${AWS::StackName}/Snort/FileLogs"},
+                    {"file_path": "/var/log/snort/data_log", "log_group_name": "/${AWS::StackName}/Snort/data_log"},
+                    {"file_path": "/var/log/snort/appid-output.log", "log_group_name": "/${AWS::StackName}/Snort/appid"},
+                    {"file_path": "/var/log/snort/alert_csv.txt", "log_group_name": "/${AWS::StackName}/Snort/alert_csv"}
+                  ]
+                }
+              }
+            },
+            "metrics": {
+              "append_dimensions": {
+                "InstanceId": "${!aws:InstanceId}"
+              },
+              "metrics_collected": {
+                "disk": {
+                  "measurement": [
+                      "used_percent"
+                  ],
+                  "metrics_collection_interval": 60,
+                  "resources": [
+                      "*"
+                  ]
+                },
+                "mem": {
+                  "measurement": [
+                    "mem_used_percent"
+                  ],
+                  "metrics_collection_interval": 60
+                },
+                "ethtool": {
+                  "interface_exclude": [
+                    "docker0", 
+                    "lo"
+                  
+                  ],
+                  "metrics_include": [
+                    "rx_packets",
+                    "tx_packets",
+                    "bw_in_allowance_exceeded",
+                    "bw_out_allowance_exceeded",
+                    "conntrack_allowance_exceeded",
+                    "linklocal_allowance_exceeded",
+                    "pps_allowance_exceeded"
+                  ]
+                }
+              }
+            }
+          }
+          EOF
+          /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json
+
+
+          ##############
+          # ECS CONFIG #
+          ##############
+          cat > /etc/ecs/ecs.config << 'EOF'
+          ECS_CLUSTER=${SnortEcsCluster}
+          ECS_ENABLE_CONTAINER_METADATA=true
+          ECS_BACKEND_HOST=
+          EOF
+
+  SnortAutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      HealthCheckGracePeriod: 600
+      HealthCheckType: ELB
+      LaunchConfigurationName: !Ref SnortLaunchConfiguration
+      MaxSize: !Ref SnortClusterMaxSize 
+      MinSize: "0" #Controlled by ECS Capacity Provider
+      NewInstancesProtectedFromScaleIn: false
+      VPCZoneIdentifier:
+      - !Ref PrivateSubnet1
+      - !Ref PrivateSubnet2
+      - !Ref PrivateSubnet3
+      TargetGroupARNs:
+      - !Ref TargetGroup
+      Tags:
+      - Key: Name
+        Value: 'Snort Instance'
+        PropagateAtLaunch: True
+
+##
+## VPC Endpoint
+##
+  VpcEndpointService:
+    Type: AWS::EC2::VPCEndpointService
+    Properties:
+      GatewayLoadBalancerArns:
+        - !Ref Gwlb
+      AcceptanceRequired: False
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      Policies:
+        - PolicyName: root
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeVpcEndpointServiceConfigurations
+                  - ec2:DescribeVpcEndpointServicePermissions
+                  - ec2:DescribeVpcEndpointServices
+                Resource: "*"
+
+  DescribeVpceService:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: "index.handler"
+      Role: !GetAtt
+        - LambdaExecutionRole
+        - Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import json
+          import logging
+          def handler(event, context):
+              logger = logging.getLogger()
+              logger.setLevel(logging.INFO)
+              responseData = {}
+              responseStatus = cfnresponse.FAILED
+              logger.info('Received event: {}'.format(json.dumps(event)))
+              if event["RequestType"] == "Delete":
+                  responseStatus = cfnresponse.SUCCESS
+                  cfnresponse.send(event, context, responseStatus, responseData)
+              if event["RequestType"] == "Create":
+                  try:
+                      VpceServiceId = event["ResourceProperties"]["Input"]
+                  except Exception as e:
+                      logger.info('VPC Endpoint Service Id retrival failure: {}'.format(e))
+                  try:
+                      ec2 = boto3.client('ec2')
+                  except Exception as e:
+                      logger.info('boto3.client failure: {}'.format(e))
+                  try:
+                      response = ec2.describe_vpc_endpoint_service_configurations(
+                          Filters=[
+                              {
+                                  'Name': 'service-id',
+                                  'Values': [VpceServiceId]
+                              }
+                          ]
+                      )
+                  except Exception as e:
+                      logger.info('ec2.describe_vpc_endpoint_service_configurations failure: {}'.format(e))
+                  ServiceName = response['ServiceConfigurations'][0]['ServiceName']
+                  responseData['Data'] = ServiceName
+                  responseStatus = cfnresponse.SUCCESS
+                  cfnresponse.send(event, context, responseStatus, responseData)
+      Runtime: python3.7
+      Timeout: 30
+
+  VpceServiceName:
+    Type: Custom::DescribeVpcEndpointServiceConfigurations
+    Properties:
+      ServiceToken: !GetAtt DescribeVpceService.Arn
+      Input: !Ref VpcEndpointService
+
+Outputs:
+  ApplianceGwlbArn:
+    Description: Appliance VPC GWLB ARN
+    Value: !Ref Gwlb
+  ApplianceVpcEndpointServiceId:
+    Description: Appliance VPC Endpoint Service ID
+    Value: !Ref VpcEndpointService
+  ApplianceVpcEndpointServiceName:
+    Description: Appliance VPC Endpoint Service Name. Required to create GWLB Endpoint
+    Value: !GetAtt VpceServiceName.Data

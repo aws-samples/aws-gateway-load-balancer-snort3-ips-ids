@@ -1,0 +1,10 @@
+{
+	"Parameters" : {
+		"PcapLogRententionS3": "5",
+		"DefaultLogRententionCloudWatch": "3",
+		"SnortInstanceType": "t3.large",
+		"SnortClusterMaxSize": "10",
+		"SnortClusterMinSize": "2",
+		"SnortCpuScalingPercentage": "80"
+    }
+}
