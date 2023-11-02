@@ -10,7 +10,7 @@ The quickest way to deploy the full solution that consists of Snort3 running on 
 
 The [snort_base.yaml](cloudformation/snort_base.yaml) template will setup a new environment from scratch, including a VPC where Snort3 will be deployed.
 
-| ![Solution_Reference Architecture]([[https://github.com/p4lcsi/scalable-snort-gwlb-cicd/blob/main/solution_architecture.png](https://github.com/aws-samples/aws-gateway-load-balancer-snort3-ips-ids/blob/main/solution_architecture.png)]([https://github.com/aws-samples/aws-gateway-load-balancer-snort3-ips-ids/blob/main/solution_architecture.png](https://github.com/aws-samples/aws-gateway-load-balancer-snort3-ips-ids/blob/main/solution_architecture.png))) |
+| ![Solution_Reference Architecture](https://github.com/aws-samples/aws-gateway-load-balancer-snort3-ips-ids/blob/main/solution_architecture.png) |
 |:--:|
 | <b> Fig.1 - Solution Reference Architecture </b>|
 
